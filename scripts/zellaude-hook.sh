@@ -134,5 +134,17 @@ if [ "$HOOK_EVENT" = "PermissionRequest" ]; then
   fi
 fi
 
-# Send to plugin (hook is already async, no need to background)
-zellij pipe --name "zellaude" -- "$PAYLOAD"
+# Send to plugin.
+#
+# `zellij pipe` blocks until the plugin accepts the message. If the Zellij
+# server or the plugin deadlocks, that pipe hangs forever — and because Claude
+# Code fires this hook on every event, hung pipes pile up (hundreds of orphaned
+# `zellij pipe` processes wedging every session's IPC). Guard against that with
+# a bounded, backgrounded send plus a watchdog that hard-kills the pipe if it
+# doesn't complete quickly. SIGKILL (not TERM) because a deadlocked server
+# ignores TERM. No coreutils dependency (`timeout` is absent on stock macOS).
+zellij pipe --name "zellaude" -- "$PAYLOAD" &
+_zellaude_pipe_pid=$!
+( sleep 2; kill -KILL "$_zellaude_pipe_pid" 2>/dev/null ) &
+
+exit 0
