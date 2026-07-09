@@ -146,5 +146,14 @@ fi
 zellij pipe --name "zellaude" -- "$PAYLOAD" &
 _zellaude_pipe_pid=$!
 ( sleep 2; kill -KILL "$_zellaude_pipe_pid" 2>/dev/null ) &
+_zellaude_watchdog_pid=$!
+
+# Normal case: the pipe returns in milliseconds, so cancel the pending kill.
+# This also avoids SIGKILLing an unrelated process should the OS recycle the
+# pipe's PID within the watchdog window (an ACE session churns through many
+# short-lived shells). The hook is registered async, so waiting up to 2s here
+# is free — Claude Code does not block on it.
+wait "$_zellaude_pipe_pid" 2>/dev/null
+kill "$_zellaude_watchdog_pid" 2>/dev/null
 
 exit 0
