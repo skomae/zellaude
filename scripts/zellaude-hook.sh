@@ -136,23 +136,32 @@ fi
 
 # Send to plugin.
 #
-# `zellij pipe` blocks until the plugin accepts the message. If the Zellij
-# server or the plugin deadlocks, that pipe hangs forever — and because Claude
-# Code fires this hook on every event, hung pipes pile up (hundreds of orphaned
-# `zellij pipe` processes wedging every session's IPC). Guard against that with
-# a bounded, backgrounded send plus a watchdog that hard-kills the pipe if it
-# doesn't complete quickly. SIGKILL (not TERM) because a deadlocked server
-# ignores TERM. No coreutils dependency (`timeout` is absent on stock macOS).
+# `zellij pipe` blocks until the plugin unblocks the pipe (the pipe protocol is
+# bidirectional and has no fire-and-forget mode). If the Zellij server or the
+# plugin deadlocks, that pipe hangs forever — and because Claude Code fires this
+# hook on every event, hung pipes pile up (hundreds of orphaned `zellij pipe`
+# processes wedging every session's IPC).
+#
+# The hook is registered `async: true` with a `timeout` in settings.json, but
+# Claude Code does NOT enforce that timeout on async hooks — it fires and
+# forgets them, so a hung pipe is never reaped (in one incident orphans lived
+# 48 minutes). The hook therefore has to bound itself: background the send and
+# run a watchdog that hard-kills the pipe if it doesn't complete in time.
+#
+# SIGKILL (not TERM) because a deadlocked server ignores TERM. No coreutils
+# dependency (`timeout` is absent on stock macOS). The window matches the
+# settings.json hook `timeout` (keep the two in sync). A clipped send only
+# drops a tab-bar telemetry update, which self-corrects on the next event.
+_ZELLAUDE_PIPE_TIMEOUT=5
 zellij pipe --name "zellaude" -- "$PAYLOAD" &
 _zellaude_pipe_pid=$!
-( sleep 2; kill -KILL "$_zellaude_pipe_pid" 2>/dev/null ) &
+( sleep "$_ZELLAUDE_PIPE_TIMEOUT"; kill -KILL "$_zellaude_pipe_pid" 2>/dev/null ) &
 _zellaude_watchdog_pid=$!
 
-# Normal case: the pipe returns in milliseconds, so cancel the pending kill.
-# This also avoids SIGKILLing an unrelated process should the OS recycle the
-# pipe's PID within the watchdog window (an ACE session churns through many
-# short-lived shells). The hook is registered async, so waiting up to 2s here
-# is free — Claude Code does not block on it.
+# Normal case: the pipe returns quickly, so cancel the pending kill. This also
+# avoids SIGKILLing an unrelated process should the OS recycle the pipe's PID
+# within the watchdog window (an ACE session churns through many short-lived
+# shells). Being async, waiting here is free — Claude Code does not block on it.
 wait "$_zellaude_pipe_pid" 2>/dev/null
 kill "$_zellaude_watchdog_pid" 2>/dev/null
 
