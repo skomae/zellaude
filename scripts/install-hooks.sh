@@ -6,7 +6,16 @@ set -euo pipefail
 
 SETTINGS="$HOME/.claude/settings.json"
 HOOK_SCRIPT="$(cd "$(dirname "$0")" && pwd)/zellaude-hook.sh"
-HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh'
+
+# Command written into settings.json for each hook event. Defaults to the
+# canonical install location (the literal ${HOME} is expanded by Claude Code
+# at hook-run time, not here). Can be overridden by a vendoring integration
+# that ships the hook at its own path and wires it directly:
+#   HOOK_CMD="bash /path/to/zellaude-hook.sh" ./install-hooks.sh
+if [ -z "${HOOK_CMD:-}" ]; then
+  # shellcheck disable=SC2016  # ${HOME} is expanded by Claude Code, not here
+  HOOK_CMD='${HOME}/.config/zellij/plugins/zellaude-hook.sh'
+fi
 
 resolve_file_symlink() {
   local path dir target
