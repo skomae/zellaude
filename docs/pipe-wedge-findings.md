@@ -69,29 +69,79 @@ Diagnostic evidence gathered during the incident:
    consumed them — consistent with the plugin's pipe-input handler falling
    behind or briefly deadlocking under burst load, then catching up.
 
-Hypotheses worth investigating in `src/` (the plugin, Rust/wasm):
+### What the code confirms (architecture)
 
-- **Pipe-input handler backpressure/deadlock under burst.** Does the plugin
-  process `PipeMessage` synchronously on the same path as render? A slow render
-  or a lock held across an `.await` could stall the pipe-drain loop while events
-  queue, then recover when the contended resource frees.
-- **Unbounded event queue vs. bounded pipe.** If the plugin buffers events and
-  the buffer/lock interacts badly with Zellij's pipe backpressure, a burst could
-  wedge the CLI side until the plugin drains.
-- **Multiple Claude clients, one plugin instance.** A single Zellij session can
-  host several Claude panes, all piping into that session's *one* zellaude
-  plugin instance. Concurrent bursts from N clients multiply the input rate.
-  Reproduce by driving 2–3 busy Claude sessions in one Zellij session and
-  watching for the wedge.
+Reading the plugin (`src/`) against the vendored `zellij-tile 0.43.1` crate
+(`~/.cargo/registry/.../zellij-tile-0.43.1`) settles the mechanism:
 
-Suggested next steps:
+- **The plugin is single-threaded and strictly serialized.** `register_plugin!`
+  stores plugin state in a `thread_local! RefCell` (crate `lib.rs`); `load`,
+  `update`, `pipe`, and `render` all `borrow_mut()` that same cell. Zellij's
+  server calls them one at a time — they cannot overlap. So a hung pipe means
+  the plugin's single execution context isn't *getting to* the next `pipe()`
+  call: it is blocked or backlogged behind other work.
+- **The CLI pipe unblocks implicitly when `pipe()` returns.** The plugin never
+  calls `block_cli_pipe_input`, yet healthy pipes drain in 0s. The blocking
+  `zellij pipe` CLI process therefore stays alive exactly until the server has
+  run this plugin's `pipe()` for its message. (Confirmed observation #1 above.)
+- **Returning `true` forces a render.** Per the `ZellijPlugin` trait docs,
+  returning `true` from `update`/`pipe` makes Zellij call `render()`.
+  `render_status_bar` (`src/render.rs`) ends in `print!` + `stdout().flush()` —
+  a WASM→host boundary call on every render.
+- **Not the inter-instance sync path.** `pipe()` also serves
+  `zellaude:request`/`:sync`/`:settings` for multi-instance state sharing, and
+  those call `pipe_message_to_plugin`. This is *not* the culprit: the sync
+  handlers are terminal (they mutate state and return — never re-broadcast), and
+  broadcasts only fire from startup (`PermissionRequestResult`) and a manual
+  settings toggle (`save_config`) — **never from a hook event**. Under a
+  hook-event burst, zero broadcasts happen. `pipe_message_to_plugin` is also
+  fire-and-forget (a queued host command), so it can't block the loop anyway.
 
-- Add instrumentation to the plugin's pipe handler (enter/exit timestamps, queue
-  depth) to catch the wedge in the act.
-- Try making the pipe-input path non-blocking / decoupled from render.
-- Consider whether the hook should also *coalesce* rapid events (e.g. debounce
-  PreToolUse/PostToolUse pairs) to cut input rate at the source — complementary
-  to the plugin-side fix.
+### The in-repo trigger (fixable here) vs. the server-side block (upstream)
+
+Two distinct things, and it matters not to conflate them:
+
+- **The block itself is server-side and self-heals** — consistent with evidence
+  #2 (blocked, then *all* pending pipes drain at once, not slowly catching up).
+  A plain O(tabs×sessions) render is only single-digit milliseconds of cheap
+  string work; that produces *lag*, not a 38-minute / 600-process wedge. "Drains
+  all at once" is the signature of the loop being **blocked and then released**,
+  not slow-but-progressing. The most plausible mechanism is host-boundary
+  backpressure — under a high render rate the `stdout().flush()` in `render`
+  fills a pipe the server drains slowly, stalling the plugin thread so it can't
+  service the next `pipe()` — **but this is a hypothesis; it lives in the Zellij
+  server and is not confirmable from this repo.** Do not go spelunking the
+  server source to prove it: it does not change the fix below.
+- **The plugin *does* own the trigger — it over-requests rendering.** `pipe()`
+  returns `true` **unconditionally** for the `"zellaude"` branch
+  (`src/main.rs`), so *every* hook event forces a full render + `stdout` flush —
+  even a `Notification` event, which `handle_hook_event` explicitly treats as
+  "refresh the timestamp, keep current activity" (nothing visible changes).
+  `update()` is similarly liberal. Under a burst this multiplies the render/flush
+  rate far beyond what the visible state actually needs.
+
+### Recommended fix (correct regardless of the exact server mechanism)
+
+Cut the render rate at its source in the plugin:
+
+- **Return `true` only when visible state changed.** Thread a
+  `visible_changed: bool` out of `handle_hook_event` and return it from `pipe()`
+  instead of the hard-coded `true`. The `Notification` no-op path (and any event
+  that doesn't alter what's drawn) then returns `false` and skips the render +
+  flush entirely. Audit `update()` the same way (e.g. `PaneUpdate` that produces
+  an identical pane map need not re-render).
+- This reduces render/`stdout`-flush frequency under burst whether the wedge is
+  queue saturation, stdout backpressure, or a server-side lock — so it's the
+  right move without confirming the upstream mechanism.
+
+Complementary, optional:
+
+- **Coalesce/debounce at the hook source** (`scripts/zellaude-hook.sh`) — e.g.
+  collapse rapid `PreToolUse`/`PostToolUse` pairs — to cut input rate before it
+  reaches the plugin.
+- **Instrument the render path** (a cheap enter/exit counter written to a debug
+  file) if you want to *measure* the render rate before/after the fix, rather
+  than trying to catch the server-side block directly.
 
 ## Reproduction sketch
 
