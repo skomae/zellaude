@@ -1,6 +1,13 @@
 use crate::state::{Activity, FlashMode, HookPayload, SessionInfo, State};
 
-pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
+/// Applies a hook event to `state`. Returns `true` if the visible status bar
+/// may have changed and a re-render is warranted, `false` if nothing drawable
+/// changed (e.g. an out-of-order drop, or a `Notification` that only refreshes
+/// a timestamp). The caller uses this to avoid forcing a render + `stdout`
+/// flush on every event: a `zellij pipe` send stays blocked until this
+/// single-threaded event loop services it, so an unnecessary render per event
+/// backs the pipes up under a busy session's event burst.
+pub fn handle_hook_event(state: &mut State, payload: HookPayload) -> bool {
     // Capture env info for use in notifications
     if let Some(ref name) = payload.zellij_session {
         state.zellij_session_name = Some(name.clone());
@@ -13,8 +20,8 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
 
     // SessionEnd → remove session (never drop: terminal cleanup)
     if event == "SessionEnd" {
-        state.sessions.remove(&payload.pane_id);
-        return;
+        // A tab may lose its Claude symbol → visible change.
+        return state.sessions.remove(&payload.pane_id).is_some();
     }
 
     // Drop events that arrive out of order (async hooks can race through
@@ -23,7 +30,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
     if let Some(ts_ms) = payload.ts_ms {
         if let Some(session) = state.sessions.get(&payload.pane_id) {
             if ts_ms < session.last_ts_ms {
-                return;
+                return false;
             }
         }
     }
@@ -37,6 +44,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
         "UserPromptSubmit" => Activity::Thinking,
         "PermissionRequest" => Activity::Waiting,
         // Notification is informational — just refresh the timestamp, keep current activity.
+        // Nothing drawable changes, so no re-render is requested.
         "Notification" => {
             if let Some(session) = state.sessions.get_mut(&payload.pane_id) {
                 session.last_event_ts = crate::state::unix_now();
@@ -44,7 +52,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
                     session.last_ts_ms = ts_ms;
                 }
             }
-            return;
+            return false;
         }
         "Stop" => Activity::Done,
         "SubagentStop" => Activity::AgentDone,
@@ -105,4 +113,7 @@ pub fn handle_hook_event(state: &mut State, payload: HookPayload) {
         session.tab_index = Some(idx);
         session.tab_name = Some(name);
     }
+
+    // Activity/flash/session fields changed → the status bar may look different.
+    true
 }

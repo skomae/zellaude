@@ -191,8 +191,11 @@ impl ZellijPlugin for State {
                     Ok(p) => p,
                     Err(_) => return false,
                 };
-                event_handler::handle_hook_event(self, payload);
-                true
+                // Only re-render if the event actually changed visible state —
+                // avoids forcing a render + stdout flush on every hook event,
+                // which would keep the sending `zellij pipe` blocked longer
+                // than necessary and back up under an event burst.
+                event_handler::handle_hook_event(self, payload)
             }
             "zellaude:focus" => {
                 // Notification click — focus the requested pane
