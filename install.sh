@@ -64,6 +64,18 @@ mkdir -p "$PLUGIN_DIR"
 cp "$PROJECT_DIR/target/wasm32-wasip1/release/zellaude.wasm" "$PLUGIN_PATH"
 dim "  installed $PLUGIN_PATH"
 
+# ── Install hook script ────────────────────────────────────
+# Deploy the hook to the path install-hooks.sh registers in settings.json.
+# Without this the installer only rewrites the settings entries and leaves
+# whatever zellaude-hook.sh already exists at the canonical path — so an
+# older, un-watchdog'd build silently survives an upgrade (this is exactly
+# how a stale hook re-orphaned hundreds of `zellij pipe` processes after a
+# plugin refresh). Copying here keeps the deployed hook in lockstep with the
+# built plugin.
+cp "$PROJECT_DIR/scripts/zellaude-hook.sh" "$PLUGIN_DIR/zellaude-hook.sh"
+chmod +x "$PLUGIN_DIR/zellaude-hook.sh"
+dim "  installed $PLUGIN_DIR/zellaude-hook.sh"
+
 # ── Install hooks ──────────────────────────────────────────
 
 "$PROJECT_DIR/scripts/install-hooks.sh"
